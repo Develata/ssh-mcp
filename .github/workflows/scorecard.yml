@@ -33,6 +33,8 @@ permissions: read-all
 
 jobs:
   analysis:
+    # Publishing to the upstream OpenSSF identity is not a fork maintenance task.
+    if: github.repository == 'tufantunc/ssh-mcp'
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:
