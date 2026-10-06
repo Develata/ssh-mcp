@@ -115,15 +115,25 @@ jobs:
           console.log("Verified linux/amd64 and linux/arm64 manifests");
           JS
           for platform in linux/amd64 linux/arm64; do
-            docker pull --platform "$platform" "$image"
-            test "$(docker run --rm --network none --platform "$platform" --entrypoint id "$image" -u)" = 65532
-            docker run --rm --network none --platform "$platform" --entrypoint cat "$image" /app/LICENSE > license.txt
+            # The classic Docker image store cannot keep two platforms under
+            # one index digest. Pull each platform's own immutable manifest.
+            platform_digest="$(PLATFORM="$platform" node -e '
+              const manifest = require("./manifest.json");
+              const [os, architecture] = process.env.PLATFORM.split("/");
+              const match = manifest.manifests.find(m => m.platform?.os === os && m.platform?.architecture === architecture);
+              if (!match) process.exit(1);
+              process.stdout.write(match.digest);
+            ')"
+            platform_image="$IMAGE@$platform_digest"
+            docker pull --platform "$platform" "$platform_image"
+            test "$(docker run --rm --network none --platform "$platform" --entrypoint id "$platform_image" -u)" = 65532
+            docker run --rm --network none --platform "$platform" --entrypoint cat "$platform_image" /app/LICENSE > license.txt
             cmp source/LICENSE license.txt
             {
               echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-publish-smoke","version":"1"}}}'
               echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
               echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run-command","arguments":{"command":"echo hi"}}}'
-            } | timeout 60 docker run --rm -i --network none --platform "$platform" "$image" > out.jsonl 2> err.txt || true
+            } | timeout 60 docker run --rm -i --network none --platform "$platform" "$platform_image" > out.jsonl 2> err.txt || true
             node - <<'JS'
           const fs = require("fs");
           const err = fs.readFileSync("err.txt", "utf8");
@@ -144,8 +154,8 @@ jobs:
           {
             echo "## Verified image"
             echo
-            echo "- Image: `$image`"
-            echo "- Tags: `2.18.0`, `sha-$UPSTREAM_SHA`"
+            printf -- '- Image: %s\n' "$image"
+            printf -- '- Tags: 2.18.0, sha-%s\n' "$UPSTREAM_SHA"
             echo "- Platforms: linux/amd64, linux/arm64"
             echo "- Source: https://github.com/tufantunc/ssh-mcp/commit/$UPSTREAM_SHA"
             echo "- Both platforms: UID 65532, upstream MIT license, MCP handshake, 14 tools, unconfigured refusal"
