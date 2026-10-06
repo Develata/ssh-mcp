@@ -1,0 +1,154 @@
+name: Publish pinned SSH MCP image
+
+on:
+  push:
+    branches: [container-publish-v2.18.0]
+
+# A separate branch avoids running the upstream npm release and Scorecard jobs.
+# No PAT, repository write, OIDC, or server credentials are needed.
+permissions: {}
+
+concurrency:
+  group: ssh-mcp-container-v2.18.0
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/develata/ssh-mcp
+  UPSTREAM_SHA: 723a7c5a4846dfba822894d566212b1a58656b5e
+  VERSION: 2.18.0
+
+jobs:
+  publish:
+    if: github.repository == 'Develata/ssh-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the fixed upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tufantunc/ssh-mcp
+          ref: 723a7c5a4846dfba822894d566212b1a58656b5e
+          persist-credentials: false
+          path: source
+
+      - name: Verify source and retain the upstream MIT license
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
+          test "$(node -p "require('./package.json').version")" = "$VERSION"
+          test -z "$(git status --porcelain)"
+          # This is the only packaging change to the pinned upstream Dockerfile.
+          # App code, lockfile, base-image digest and runtime user are unchanged.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Dockerfile")
+          original = p.read_text()
+          anchor = "COPY config.default.toml ./config.default.toml\n"
+          assert original.count(anchor) == 1, "upstream Dockerfile changed"
+          assert "MIT License" in Path("LICENSE").read_text()
+          p.write_text(original.replace(anchor, anchor + "COPY LICENSE ./LICENSE\n"))
+          PY
+          git diff --exit-code -- . ':!Dockerfile'
+          git diff -- Dockerfile
+
+      - name: Set up arm64 emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish both platforms
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./source
+          file: ./source/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ghcr.io/develata/ssh-mcp:2.18.0
+            ghcr.io/develata/ssh-mcp:sha-723a7c5a4846dfba822894d566212b1a58656b5e
+          labels: |
+            org.opencontainers.image.title=ssh-mcp
+            org.opencontainers.image.description=SSH MCP 2.18.0 from pinned upstream source, packaged by Develata
+            org.opencontainers.image.source=https://github.com/Develata/ssh-mcp
+            org.opencontainers.image.url=https://github.com/tufantunc/ssh-mcp
+            org.opencontainers.image.version=2.18.0
+            org.opencontainers.image.revision=723a7c5a4846dfba822894d566212b1a58656b5e
+            org.opencontainers.image.licenses=MIT
+            io.github.develata.ssh-mcp.packaging-revision=${{ github.sha }}
+            io.github.develata.ssh-mcp.upstream=https://github.com/tufantunc/ssh-mcp/commit/723a7c5a4846dfba822894d566212b1a58656b5e
+
+      - name: Verify published manifest and smoke test both platforms
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$image" --raw > manifest.json
+          node - <<'JS'
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+          const platforms = manifest.manifests
+            .filter(m => m.platform?.os === "linux")
+            .map(m => m.platform.architecture).sort();
+          if (JSON.stringify(platforms) !== JSON.stringify(["amd64", "arm64"])) {
+            throw new Error("Unexpected platforms: " + JSON.stringify(platforms));
+          }
+          console.log("Verified linux/amd64 and linux/arm64 manifests");
+          JS
+          for platform in linux/amd64 linux/arm64; do
+            docker pull --platform "$platform" "$image"
+            test "$(docker run --rm --network none --platform "$platform" --entrypoint id "$image" -u)" = 65532
+            docker run --rm --network none --platform "$platform" --entrypoint cat "$image" /app/LICENSE > license.txt
+            cmp source/LICENSE license.txt
+            {
+              echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-publish-smoke","version":"1"}}}'
+              echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+              echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run-command","arguments":{"command":"echo hi"}}}'
+            } | timeout 60 docker run --rm -i --network none --platform "$platform" "$image" > out.jsonl 2> err.txt || true
+            node - <<'JS'
+          const fs = require("fs");
+          const err = fs.readFileSync("err.txt", "utf8");
+          const replies = fs.readFileSync("out.jsonl", "utf8").split("\n").filter(Boolean).map(JSON.parse);
+          const byId = id => replies.find(r => r.id === id);
+          const fail = message => { console.error(message + "\n" + err); process.exit(1); };
+          if (byId(1)?.result?.serverInfo?.name !== "SSH MCP Server") fail("No initialize reply");
+          const tools = byId(2)?.result?.tools;
+          if (!Array.isArray(tools) || tools.length !== 14) fail("Expected 14 MCP tools");
+          const call = byId(3)?.result;
+          if (call?.isError !== true || !/No config file found/.test(JSON.stringify(call.content))) {
+            fail("Unconfigured image must refuse command execution");
+          }
+          console.log("MCP handshake, 14 tools and unconfigured refusal passed");
+          JS
+            echo "$platform: UID 65532, MIT license and MCP smoke test passed"
+          done
+          {
+            echo "## Verified image"
+            echo
+            echo "- Image: `$image`"
+            echo "- Tags: `2.18.0`, `sha-$UPSTREAM_SHA`"
+            echo "- Platforms: linux/amd64, linux/arm64"
+            echo "- Source: https://github.com/tufantunc/ssh-mcp/commit/$UPSTREAM_SHA"
+            echo "- Both platforms: UID 65532, upstream MIT license, MCP handshake, 14 tools, unconfigured refusal"
+            echo "- No server configuration or credentials are included"
+            echo "- Tags may be replaced by future rebuilds; use the digest above for an immutable reference"
+          } >> "$GITHUB_STEP_SUMMARY"
