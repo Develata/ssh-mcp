@@ -136,6 +136,7 @@ jobs:
           echo "lcov records: $(grep -c '^SF:' coverage/lcov.info)"
 
       - name: Upload coverage reports to Codecov
+        if: github.repository == 'tufantunc/ssh-mcp'
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -198,6 +199,7 @@ jobs:
           echo "lcov records: $(grep -c '^SF:' coverage/lcov.info)"
 
       - name: Upload coverage reports to Codecov
+        if: github.repository == 'tufantunc/ssh-mcp'
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -278,7 +280,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -339,7 +340,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -368,6 +368,9 @@ jobs:
 
       - name: Analyze
         uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          # Keep CodeQL analysis in fork CI without uploading code-scanning results.
+          upload: never
 
   # Build the image this repo ships, and prove it starts.
   #

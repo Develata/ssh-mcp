@@ -29,7 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     # A `list_only` dispatch is for a version that reached npm but never reached
     # the registry, so it must not go near the publish path again.
-    if: github.event.inputs.list_only != 'true'
+    # Forks must not run upstream npm publishing or release automation.
+    if: github.repository == 'tufantunc/ssh-mcp' && github.event.inputs.list_only != 'true'
     permissions:
       contents: write
       id-token: write
@@ -218,6 +219,7 @@ jobs:
     # the asset upload clobbers.
     if: >-
       ${{ !cancelled()
+      && github.repository == 'tufantunc/ssh-mcp'
       && github.ref == 'refs/heads/main'
       && (needs.release.outputs.published == 'true'
       || github.event.inputs.list_only == 'true') }}
@@ -367,7 +369,7 @@ jobs:
     # `!cancelled()` alone would run this after a *failed* sbom job, where
     # release-tag.txt does not exist and `cat` would fail on a missing file
     # instead of reporting the real problem upstream.
-    if: ${{ !cancelled() && needs.sbom.result == 'success' }}
+    if: ${{ !cancelled() && github.repository == 'tufantunc/ssh-mcp' && needs.sbom.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -437,6 +439,7 @@ jobs:
     # `server.json` under our namespace.
     if: >-
       ${{ !cancelled()
+      && github.repository == 'tufantunc/ssh-mcp'
       && github.ref == 'refs/heads/main'
       && (needs.release.outputs.published == 'true'
       || github.event.inputs.list_only == 'true') }}
@@ -653,6 +656,7 @@ jobs:
     # which of the four things is missing rather than skipping in sympathy.
     if: >-
       ${{ !cancelled()
+      && github.repository == 'tufantunc/ssh-mcp'
       && github.ref == 'refs/heads/main'
       && (needs.release.outputs.published == 'true'
       || github.event.inputs.list_only == 'true') }}
