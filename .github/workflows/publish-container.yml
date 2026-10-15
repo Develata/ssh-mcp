@@ -1,291 +1,314 @@
-name: Pinned SSH MCP container
+name: Sync and publish SSH MCP
 
 on:
   pull_request:
     branches: [main]
-    paths:
-      - '.github/workflows/publish-container.yml'
-      - 'docs/develata-container.md'
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/publish-container.yml'
-      - 'docs/develata-container.md'
+  # Daily wake; the UTC date gate below admits every third day from 2026-10-15.
+  # Unlike day-of-month */3, this remains three days across month boundaries.
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish the fixed source below to GHCR (main only; refuses existing tags)'
+        description: 'Sync latest stable upstream and publish after all checks (main only)'
         type: boolean
         required: true
         default: false
 
-# PRs and main pushes only build and test. Publishing is a separate, explicit
-# manual decision; no PAT, repository write, OIDC, or server credentials.
 permissions:
   contents: read
 
 concurrency:
-  group: ssh-mcp-container-v2.18.0
+  group: ssh-mcp-container-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
   cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/develata/ssh-mcp
-  UPSTREAM_SHA: 723a7c5a4846dfba822894d566212b1a58656b5e
-  VERSION: 2.18.0
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
-  validate:
-    name: Validate pinned image (${{ matrix.platform }})
+  prepare:
     if: github.repository == 'Develata/ssh-mcp'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      active: ${{ steps.gate.outputs.active }}
+      base: ${{ steps.candidate.outputs.base }}
+      sha: ${{ steps.candidate.outputs.sha }}
+      upstream: ${{ steps.candidate.outputs.upstream }}
+      version: ${{ steps.candidate.outputs.version }}
+      version_tag: ${{ steps.candidate.outputs.versionTag }}
+      publish: ${{ steps.candidate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: automation
+      - name: Apply the three-day UTC gate
+        id: gate
+        working-directory: automation
+        run: |
+          node --input-type=module -e '
+            import { scheduledDay } from "./.github/container/policy.mjs";
+            import { appendFileSync } from "node:fs";
+            const active = process.env.GITHUB_EVENT_NAME !== "schedule" || scheduledDay();
+            appendFileSync(process.env.GITHUB_OUTPUT, "active=" + active + "\n");
+            console.log(active ? "Checks are due" : "Outside the three-day UTC window");
+          '
+      - name: Check automation syntax and policy regressions
+        if: steps.gate.outputs.active == 'true'
+        working-directory: automation
+        run: |
+          set -euo pipefail
+          node --test .github/container/policy.check.mjs
+          for script in .github/container/*.mjs; do node --check "$script"; done
+          shellcheck .github/container/restore.sh
+          curl --fail --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" .github/workflows/publish-container.yml
+      - name: Prepare a clean merge candidate without repository writes
+        if: steps.gate.outputs.active == 'true'
+        id: candidate
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          git clone --no-local --no-checkout automation source
+          git -C source checkout --detach "$GITHUB_SHA"
+          node automation/.github/container/prepare.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.gate.outputs.active == 'true'
+        with:
+          name: container-source
+          path: |
+            candidate.bundle
+            candidate.json
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: true
+
+  source-test:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: automation
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-source
+      - run: bash automation/.github/container/restore.sh
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install, build and typecheck
+        working-directory: source
+        run: |
+          npm ci
+          npm run typecheck
+      - name: Enable pnpm packaging coverage
+        if: runner.os == 'Linux'
+        run: corepack enable
+      - name: Start real SSH integration fixtures
+        if: runner.os == 'Linux'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker compose --profile test pull --quiet; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
+          docker compose --profile test up -d --build --wait
+          for port in 2222 2223 2224 2225 2226 2227; do
+            ready=false
+            for attempt in $(seq 1 60); do
+              if nc -z 127.0.0.1 "$port"; then ready=true; break; fi
+              sleep 1
+            done
+            test "$ready" = true
+          done
+      - name: Full Linux suite, including integration and e2e
+        if: runner.os == 'Linux'
+        working-directory: source
+        env:
+          SSH_MCP_REQUIRE_SERVERS: '1'
+          SSH_MCP_ADMIN_PASSWORD: secret
+          SSH_MCP_OPERATOR_PASSWORD: oppass
+          SSH_MCP_VIEWER_PASSWORD: viewpass
+          SSH_MCP_ADMIN_SUDO_PASSWORD: secret
+          SSH_MCP_OPERATOR_SUDO_PASSWORD: oppass
+        run: npm test
+      - name: Windows and macOS unit and property tests
+        if: runner.os != 'Linux'
+        working-directory: source
+        run: npm run test:unit
+      - name: SSH fixture logs
+        if: failure() && runner.os == 'Linux'
+        working-directory: source
+        run: docker compose --profile test logs --tail=100
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
         platform: [linux/amd64, linux/arm64]
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
-      - name: Check out the fixed upstream source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: tufantunc/ssh-mcp
-          ref: 723a7c5a4846dfba822894d566212b1a58656b5e
           persist-credentials: false
-          path: source
-
-      - name: Verify source and retain the upstream MIT license
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
-          test "$(node -p "require('./package.json').version")" = "$VERSION"
-          test -z "$(git status --porcelain)"
-          # This is the only packaging change to the pinned upstream Dockerfile.
-          # App code, lockfile, base-image digest and runtime user are unchanged.
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("Dockerfile")
-          original = p.read_text()
-          anchor = "COPY config.default.toml ./config.default.toml\n"
-          assert original.count(anchor) == 1, "upstream Dockerfile changed"
-          assert "MIT License" in Path("LICENSE").read_text()
-          p.write_text(original.replace(anchor, anchor + "COPY LICENSE ./LICENSE\n"))
-          PY
-          git diff --exit-code -- . ':!Dockerfile'
-          git diff -- Dockerfile
-
-      - name: Set up arm64 emulation
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+          path: automation
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-source
+      - run: bash automation/.github/container/restore.sh
+      - run: node automation/.github/container/package.mjs
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Build without publishing
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build without registry credentials or publication
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./source
-          file: ./source/Dockerfile
           platforms: ${{ matrix.platform }}
           push: false
           load: true
           provenance: false
           sbom: false
           tags: ssh-mcp:validation
+      - name: Smoke test this architecture
+        run: node automation/.github/container/smoke.mjs ssh-mcp:validation "$PLATFORM" "$VERSION"
 
-      - name: Smoke test the local image
+  sync:
+    needs: [prepare, source-test, validate]
+    if: github.repository == 'Develata/ssh-mcp' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This isolated job never runs application/dependency/build scripts.
+    permissions:
+      contents: write
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+      BASE_SHA: ${{ needs.prepare.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: automation
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-source
+      - run: bash automation/.github/container/restore.sh
+      - name: Fast-forward main to the tested candidate, never force
         env:
-          PLATFORM: ${{ matrix.platform }}
-        shell: bash
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          image=ssh-mcp:validation
-          test "$(docker run --rm --network none --platform "$PLATFORM" --entrypoint id "$image" -u)" = 65532
-          docker run --rm --network none --platform "$PLATFORM" --entrypoint cat "$image" /app/LICENSE > license.txt
-          cmp source/LICENSE license.txt
-          {
-            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-validation","version":"1"}}}'
-            echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-            echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run-command","arguments":{"command":"echo hi"}}}'
-          } | timeout 60 docker run --rm -i --network none --platform "$PLATFORM" "$image" > out.jsonl 2> err.txt || true
-          node - <<'JS'
-          const fs = require("fs");
-          const err = fs.readFileSync("err.txt", "utf8");
-          const replies = fs.readFileSync("out.jsonl", "utf8").split("\n").filter(Boolean).map(JSON.parse);
-          const byId = id => replies.find(r => r.id === id);
-          const fail = message => { console.error(message + "\n" + err); process.exit(1); };
-          if (byId(1)?.result?.serverInfo?.name !== "SSH MCP Server") fail("No initialize reply");
-          if (byId(2)?.result?.tools?.length !== 14) fail("Expected 14 MCP tools");
-          const call = byId(3)?.result;
-          if (call?.isError !== true || !/No config file found/.test(JSON.stringify(call.content))) {
-            fail("Unconfigured image must refuse command execution");
-          }
-          console.log("UID, license, handshake, 14 tools and unconfigured refusal passed");
-          JS
+          remote=https://github.com/Develata/ssh-mcp.git
+          head="$(git ls-remote "$remote" refs/heads/main | cut -f1)"
+          if [ "$head" = "$SOURCE_SHA" ]; then exit 0; fi
+          test "$head" = "$BASE_SHA" || { echo "::error::Main changed; rerun against its new head"; exit 1; }
+          git -C source merge-base --is-ancestor "$BASE_SHA" "$SOURCE_SHA"
+          git -C source diff --exit-code "$BASE_SHA" "$SOURCE_SHA" -- .github docs/develata-container.md
+          git -C source -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            push "$remote" "$SOURCE_SHA:refs/heads/main"
+          test "$(git ls-remote "$remote" refs/heads/main | cut -f1)" = "$SOURCE_SHA"
 
   publish:
-    needs: validate
-    # No PR, push, tag, schedule, non-main dispatch, or other repository can publish.
-    if: github.repository == 'Develata/ssh-mcp' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
+    needs: [prepare, sync]
+    if: github.repository == 'Develata/ssh-mcp' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     permissions:
       contents: read
       packages: write
+    env:
+      SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+      VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - name: Check out the fixed upstream source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: tufantunc/ssh-mcp
-          ref: 723a7c5a4846dfba822894d566212b1a58656b5e
           persist-credentials: false
-          path: source
-
-      - name: Verify source and retain the upstream MIT license
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
-          test "$(node -p "require('./package.json').version")" = "$VERSION"
-          test -z "$(git status --porcelain)"
-          # This is the only packaging change to the pinned upstream Dockerfile.
-          # App code, lockfile, base-image digest and runtime user are unchanged.
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("Dockerfile")
-          original = p.read_text()
-          anchor = "COPY config.default.toml ./config.default.toml\n"
-          assert original.count(anchor) == 1, "upstream Dockerfile changed"
-          assert "MIT License" in Path("LICENSE").read_text()
-          p.write_text(original.replace(anchor, anchor + "COPY LICENSE ./LICENSE\n"))
-          PY
-          git diff --exit-code -- . ':!Dockerfile'
-          git diff -- Dockerfile
-
-      - name: Set up arm64 emulation
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+          path: automation
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-source
+      - run: bash automation/.github/container/restore.sh
+      - run: node automation/.github/container/package.mjs
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Refuse to overwrite either published tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          for tag in "$VERSION" "sha-$UPSTREAM_SHA"; do
-            if docker buildx imagetools inspect "$IMAGE:$tag" > manifest.txt 2> inspect.err; then
-              echo "::error::$IMAGE:$tag already exists. Use its digest; do not replace it."
-              exit 1
-            fi
-            # A registry/auth/network error is not evidence that the tag is free.
-            if ! grep -Eq '(manifest unknown|not found)' inspect.err; then
-              cat inspect.err >&2
-              echo "::error::Could not establish that $IMAGE:$tag is absent"
-              exit 1
-            fi
-          done
-
-      - name: Build and publish both platforms
+      - name: Check immutable tags and safely reuse completed publications
+        id: existing
+        run: node automation/.github/container/registry.mjs preflight
+      - name: Build only a run-specific staging tag
+        if: steps.existing.outputs.build == 'true'
         id: image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./source
-          file: ./source/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ghcr.io/develata/ssh-mcp:2.18.0
-            ghcr.io/develata/ssh-mcp:sha-723a7c5a4846dfba822894d566212b1a58656b5e
+          tags: ghcr.io/develata/ssh-mcp:candidate-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.title=ssh-mcp
-            org.opencontainers.image.description=SSH MCP 2.18.0 from pinned upstream source, packaged by Develata
+            org.opencontainers.image.description=Verified Develata packaging of SSH MCP
             org.opencontainers.image.source=https://github.com/Develata/ssh-mcp
-            org.opencontainers.image.url=https://github.com/tufantunc/ssh-mcp
-            org.opencontainers.image.version=2.18.0
-            org.opencontainers.image.revision=723a7c5a4846dfba822894d566212b1a58656b5e
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version_tag }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
             org.opencontainers.image.licenses=MIT
+            io.github.develata.ssh-mcp.upstream-revision=${{ needs.prepare.outputs.upstream }}
+            io.github.develata.ssh-mcp.upstream-version=${{ needs.prepare.outputs.version }}
             io.github.develata.ssh-mcp.packaging-revision=${{ github.sha }}
-            io.github.develata.ssh-mcp.upstream=https://github.com/tufantunc/ssh-mcp/commit/723a7c5a4846dfba822894d566212b1a58656b5e
-
-      - name: Verify published manifest and smoke test both platforms
+      - name: Pull, inspect and smoke-test the exact digest before assigning immutable tags
         env:
-          DIGEST: ${{ steps.image.outputs.digest }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="$IMAGE@$DIGEST"
-          docker buildx imagetools inspect "$image" --raw > manifest.json
-          node - <<'JS'
-          const fs = require("fs");
-          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
-          const platforms = manifest.manifests
-            .filter(m => m.platform?.os === "linux")
-            .map(m => m.platform.architecture).sort();
-          if (JSON.stringify(platforms) !== JSON.stringify(["amd64", "arm64"])) {
-            throw new Error("Unexpected platforms: " + JSON.stringify(platforms));
-          }
-          console.log("Verified linux/amd64 and linux/arm64 manifests");
-          JS
-          for platform in linux/amd64 linux/arm64; do
-            # The classic Docker image store cannot keep two platforms under
-            # one index digest. Pull each platform's own immutable manifest.
-            platform_digest="$(PLATFORM="$platform" node -e '
-              const manifest = require("./manifest.json");
-              const [os, architecture] = process.env.PLATFORM.split("/");
-              const match = manifest.manifests.find(m => m.platform?.os === os && m.platform?.architecture === architecture);
-              if (!match) process.exit(1);
-              process.stdout.write(match.digest);
-            ')"
-            platform_image="$IMAGE@$platform_digest"
-            docker pull --platform "$platform" "$platform_image"
-            test "$(docker run --rm --network none --platform "$platform" --entrypoint id "$platform_image" -u)" = 65532
-            docker run --rm --network none --platform "$platform" --entrypoint cat "$platform_image" /app/LICENSE > license.txt
-            cmp source/LICENSE license.txt
-            {
-              echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-publish-smoke","version":"1"}}}'
-              echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-              echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run-command","arguments":{"command":"echo hi"}}}'
-            } | timeout 60 docker run --rm -i --network none --platform "$platform" "$platform_image" > out.jsonl 2> err.txt || true
-            node - <<'JS'
-          const fs = require("fs");
-          const err = fs.readFileSync("err.txt", "utf8");
-          const replies = fs.readFileSync("out.jsonl", "utf8").split("\n").filter(Boolean).map(JSON.parse);
-          const byId = id => replies.find(r => r.id === id);
-          const fail = message => { console.error(message + "\n" + err); process.exit(1); };
-          if (byId(1)?.result?.serverInfo?.name !== "SSH MCP Server") fail("No initialize reply");
-          const tools = byId(2)?.result?.tools;
-          if (!Array.isArray(tools) || tools.length !== 14) fail("Expected 14 MCP tools");
-          const call = byId(3)?.result;
-          if (call?.isError !== true || !/No config file found/.test(JSON.stringify(call.content))) {
-            fail("Unconfigured image must refuse command execution");
-          }
-          console.log("MCP handshake, 14 tools and unconfigured refusal passed");
-          JS
-            echo "$platform: UID 65532, MIT license and MCP smoke test passed"
-          done
-          {
-            echo "## Verified image"
-            echo
-            printf -- '- Image: %s\n' "$image"
-            printf -- '- Tags: 2.18.0, sha-%s\n' "$UPSTREAM_SHA"
-            echo "- Platforms: linux/amd64, linux/arm64"
-            echo "- Source: https://github.com/tufantunc/ssh-mcp/commit/$UPSTREAM_SHA"
-            echo "- Both platforms: UID 65532, upstream MIT license, MCP handshake, 14 tools, unconfigured refusal"
-            echo "- No server configuration or credentials are included"
-            echo "- Existing tags are refused by the publisher; use the digest above for deployment"
-          } >> "$GITHUB_STEP_SUMMARY"
+          DIGEST: ${{ steps.existing.outputs.digest || steps.image.outputs.digest }}
+        run: node automation/.github/container/registry.mjs verify
+      - name: Retain source and digest evidence before promotion
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-publication
+          path: publication.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: true
+      - name: Promote the verified digest to latest last
+        env:
+          DIGEST: ${{ steps.existing.outputs.digest || steps.image.outputs.digest }}
+        run: node automation/.github/container/registry.mjs promote
