@@ -593,11 +593,29 @@ read-only only with the options and operands its grammar lists; `--foo` is not a
 there. ``), so the caller can see which spelling of the same command still works. See
 [SECURITY.md](./SECURITY.md) for the residual risks this leaves open.
 
+A reader also falls to `safe` when its command carries a shell metacharacter — `;` `&` `|`
+`<` `>` `` ` `` `$` `(` `)` `{` `}`, a newline or a carriage return — quoted or not, because
+the allowlist vouches for the binary, never for what a shell might do with the rest of the
+line. The refusal names the first such character. For `sftp-list` and `sftp-download` it is
+in the remote path, so `/srv/backup(old)` is refused for a `readOnly` profile with
+`` The remote path contains `(`, which counts as a shell metacharacter here, so `sftp:list`
+is read-only only for a path without one. ``
+
 A separate **forbidden** list is never allowed, whatever the role or approval
 policy: `rm -rf /`, `mkfs`, `dd of=/dev/`, `shutdown`, `curl|sh`, fork bombs,
-writes to `/etc/cron`, `/etc/systemd` or `authorized_keys`, `iptables -F`, and
-recursive `chmod 777 /` / `chown /`. Add your own patterns via the policy
-denylist; an invalid pattern fails at startup rather than degrading silently.
+writes naming `/etc/cron`, `/etc/systemd` or any user's `authorized_keys`,
+`iptables -F`, and recursive `chmod 777 /` / `chown /`. A write *names* one of
+those paths when it is the remote path of an upload tool, the target of a shell
+redirect, or a destination of `tee`, `cp`, `mv`, `install` or `dd of=` — in any
+spelling the path readings above resolve. The two `/etc` families match by
+prefix, so `/etc/crontab` is covered along with everything under `/etc/cron.d`,
+and a sibling that merely starts like the directory (say `/etc/cronography`) is
+refused too — the fail-closed direction. Writes spelled any other way (`sed -i`,
+`rsync`, cmd.exe's `copy`, `move` and `robocopy`, a program handed to an
+interpreter, a path the target computes) are not on this list; class and approval
+govern them, and the operator denylist can close them. Add your own patterns via
+the policy denylist; an invalid pattern fails at
+startup rather than degrading silently.
 
 ### Approval Modes
 
@@ -693,8 +711,10 @@ The request shape is modeled on the AuthZEN Access Evaluation contract:
 For the five SFTP tools, `resource` also carries three path keys: `remotePath`,
 the path as given; and `remotePathNormalized` and `remotePathWindows`, the same
 two readings the local denylist tests, so a rule can match a canonical spelling
-without parsing `command` or reimplementing either reading in Rego. Other tools
-omit all three, and so does an empty path. `remotePath` is **as given** —
+without parsing `command` or reimplementing either reading in Rego. The two
+upload tools add `remoteWrite: true`, the fact the local policy refuses the
+never-allowed write paths on — a rule can gate writes without parsing `command`
+either. Other tools omit all four, and so does an empty path. `remotePath` is **as given** —
 `/root//.ssh/x` arrives spelled that way, so a `startswith` rule on a directory
 misses it: match trailing segments, or match the normalized keys.
 `remotePathWindows` keeps the case it was given; `lower()` both sides in the

@@ -1,6 +1,7 @@
-import type { CommandClass, ParsedCommand } from '../types.js';
+import type { CommandClass, ParsedCommand, ReadOnlyRejection } from '../types.js';
 import { AWK_NAMES, readAwkInvocation, type AwkFindings } from './awk.js';
 import { matchesGrammar, type ArgGrammar } from './reader-grammar.js';
+import { findNeverAllowedWriteTarget, neverAllowedWriteLabel, type NeverAllowedWriteTarget } from './never-allowed-writes.js';
 
 /**
  * Anything through which the shell can start a second command.
@@ -599,7 +600,10 @@ const READ_ONLY_SYNTHETIC = new Set(['sftp:list', 'sftp:download']);
 /**
  * Commands that are never allowed, whatever the role or approval policy.
  *
- * This is the policy engine's denylist — the single definition of it. The
+ * This is the policy engine's denylist — the regex half of it. The word-based
+ * rules live below in FORBIDDEN_RULES, and the write-path families in
+ * never-allowed-writes.ts, which both the rules and the engine's resource
+ * check read. The
  * engine used to keep a parallel copy as regex *strings*, which had already
  * drifted (it was missing the fork bomb and the recursive chown, and its `rm`
  * pattern was narrower). Anything here is also destructive for classification
@@ -645,9 +649,6 @@ const FORBIDDEN_PATTERNS: RegExp[] = [
   // against the target host rather than against this server, which is not worth either
   // trade — but it is a hole, not a closed door.
   /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
-  />\s*\/etc\/cron/,
-  />\s*\/etc\/systemd/,
-  />\s*~\/.ssh\/authorized_keys/,
   /\biptables\s+-F\b/,
   /\bchmod\s+-R\s+777\s+\//,
 ];
@@ -1572,11 +1573,20 @@ function pipesDownloadIntoShell(command: string, dialect: ShellDialect = 'posix'
   return heads.slice(firstDownload + 1).some((h) => h !== undefined && SHELLS.has(h));
 }
 
-/** `dd … of=/dev/sda` — writing an image straight onto a block device. */
+/**
+ * `dd … of=/dev/sda` — writing an image straight onto a block device.
+ *
+ * Head via `effectiveCommandIndex`, not `parseSegments`: the privilege-prefix-only
+ * machine missed a wrapped `env dd of=/dev/sda` (measured in review) while the
+ * never-allowed write scan next door caught `env cp` — two dd readers two rules
+ * apart must not answer through different head-extraction machines.
+ */
 function writesToDevice(command: string, dialect: ShellDialect = 'posix'): boolean {
-  return parseSegments(command, dialect).some(
-    ({ head, args }) => head === 'dd' && args.some((a) => a.startsWith('of=/dev/')),
-  );
+  return tokenizeSegments(command, dialect).some((words) => {
+    const idx = effectiveCommandIndex(words);
+    return idx !== -1 && stripPath(words[idx]) === 'dd'
+      && words.slice(idx + 1).some((a) => a.startsWith('of=/dev/'));
+  });
 }
 
 /**
@@ -1599,6 +1609,257 @@ interface ForbiddenRule {
   test: (command: string, dialect: ShellDialect) => boolean;
 }
 
+/**
+ * One dequoted word starting at `start`, as the redirect-target reader needs it.
+ *
+ * Stops at whitespace, at a character that begins another shell construct (`; | & < >
+ * ( )`), or at the end. Quotes are dropped and a closing quote does not end the
+ * word — the shell concatenates what follows it, so `> "/etc/cron.d"/x`,
+ * `> ""~/x` and `> a"b"c` all read as one target (the review round measured the
+ * `break`-on-close reading as a bypass: `> ""~/.ssh/authorized_keys` fell through).
+ * The quote/escape state machine is the same one `tokenizeSegmentsDetailed` runs
+ * (both keyed on DOUBLE_QUOTE_ESCAPABLE); a dialect fix must land in both loops.
+ */
+function readDequotedWord(command: string, start: number, dialect: ShellDialect): string {
+  const n = command.length;
+  if (start >= n || /[\s;&|<>()]/.test(command[start])) return '';
+  let word = '';
+  let quote: string | null = command[start] === '"' || command[start] === "'" ? command[start] : null;
+  let escaped = false;
+  for (let i = quote === null ? start : start + 1; i < n; i++) {
+    const ch = command[i];
+    if (escaped) { word += ch; escaped = false; continue; }
+    if (dialect === 'posix' && ch === '\\') {
+      if (quote === "'") { word += ch; continue; }
+      if (quote === '"') {
+        const next = command[i + 1];
+        if (next === undefined || DOUBLE_QUOTE_ESCAPABLE.has(next)) { escaped = true; continue; }
+        word += ch; continue;
+      }
+      escaped = true; continue;
+    }
+    if (quote) {
+      if (ch === quote) { quote = null; continue; }
+      word += ch; continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (/[\s;&|<>()]/.test(ch)) break;
+    word += ch;
+  }
+  return word;
+}
+
+/**
+ * Every shell-redirect target in `command`, dequoted the way the shell will pass it.
+ *
+ * A redirect is an unquoted `>` — alone (`> f`), attached to the word it ends
+ * (`echo x>f`, which bash also reads as a redirect), doubled (`>>`), with an fd
+ * prefix (`2>`, `2>>`), with the both-streams spellings (`&>`, `&>>`, `>&`) or
+ * with the noclobber-override marker (`>|`). A `>` inside quotes is data
+ * (`echo "> f"` prints a string) and yields nothing, which is what separates this
+ * scan from the raw regexes it replaces: those fired on the quoted text too, so a
+ * commit message quoting a redirect was a refusal nobody could switch off
+ * (measured on main).
+ *
+ * The target is the next word after the operator, quoted or attached. An operator
+ * with nothing readable after it is a syntax error the remote shell would report,
+ * and yields nothing. `>(...)` process substitution yields nothing here too — its
+ * inner command is a carrier `nestedCommands` already reads.
+ */
+function redirectTargets(command: string, dialect: ShellDialect): string[] {
+  const targets: string[] = [];
+  const n = command.length;
+  let quote: string | null = null;
+  let escaped = false;
+  for (let i = 0; i < n; i++) {
+    const ch = command[i];
+    if (escaped) { escaped = false; continue; }
+    if (dialect === 'posix' && ch === '\\' && quote !== "'") { escaped = true; continue; }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch !== '>' && !(ch === '&' && command[i + 1] === '>')) continue;
+
+    let j = ch === '&' ? i + 2 : i + 1;
+    if (command[j] === '>') j++;   // >>
+    if (command[j] === '&') j++;   // >& fd duplication
+    if (command[j] === '|') j++;   // >| noclobber override
+    while (j < n && /\s/.test(command[j])) j++;
+    const word = readDequotedWord(command, j, dialect);
+    if (word !== '') targets.push(word);
+    i = j - 1;
+  }
+  return targets;
+}
+
+/**
+ * xargs's own value-taking flags — one tool's option set, enumerable the way
+ * `PREFIX_VALUE_FLAGS` holds sudo's. `effectiveCommandIndex` steps a wrapper's
+ * flags with *sudo's* set, so `xargs -I {}` leaves `{}` looking like the command
+ * and the verb xargs really runs hides behind it (measured in review:
+ * `xargs -I {} cp {} /root/.ssh/authorized_keys` passed).
+ */
+const XARGS_VALUE_FLAGS = new Set(['-I', '-J', '-d', '-E', '-n', '-s', '-P', '-R', '-L', '-S']);
+
+/**
+ * The command index for a segment whose wrapper may be `xargs`, which the plain
+ * `effectiveCommandIndex` cannot step past. Same walk, one addition; runs
+ * alongside the plain index so nothing else changes.
+ */
+function indexPastXargsFlags(words: string[]): number {
+  let i = 0;
+  while (i < words.length) {
+    const raw = words[i];
+    const word = stripPath(unquote(raw));
+
+    if (word === 'xargs') {
+      i++;
+      while (i < words.length && words[i].startsWith('-')) {
+        const consumesValue = XARGS_VALUE_FLAGS.has(words[i]);
+        i++;
+        if (consumesValue) i++;
+      }
+      continue;
+    }
+    if (PRIVILEGE_PREFIXES.has(word) || EXEC_WRAPPERS.has(word)) { i++; continue; }
+    if (ASSIGNMENT.test(raw) || raw.startsWith('-') || BARE_NUMERIC.test(raw)) { i++; continue; }
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * The positional operands of the copy family, with every option spelling that
+ * carries a value stepped over.
+ *
+ * GNU getopt permutes options anywhere in the argv — `install k
+ * /root/.ssh/authorized_keys -m 600` is ordinary usage — so a value-taking flag
+ * trailing the destination must not have its value read as the last positional
+ * (measured in review: it displaced the destination and the write was missed).
+ * `-t`/`--target-directory` in all three spellings (`-t DIR`, `-tDIR`,
+ * `--target-directory=DIR`, `--target-directory DIR`) is stepped here too; the
+ * caller reads its value as the destination itself.
+ */
+function copyPositionals(args: string[]): string[] {
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '-t' || arg === '--target-directory') { i++; continue; }
+    if (/^-t.+/.test(arg) || /^--target-directory=/.test(arg)) continue;
+    // An attached short value (`-m600`) needs no line of its own: the generic
+    // `-` skip below already keeps it out of the positionals.
+    if (arg === '-m' || arg === '-o' || arg === '-g' || arg === '-S' || arg === '-Z') { i++; continue; }
+    if (/^--(mode|owner|group|suffix|context|sparse)=/.test(arg)) continue;
+    if (arg === '--mode' || arg === '--owner' || arg === '--group' || arg === '--suffix'
+      || arg === '--context' || arg === '--sparse') { i++; continue; }
+    if (arg.startsWith('-')) continue;
+    positional.push(arg);
+  }
+  return positional;
+}
+
+/**
+ * The destination operands of the verbs whose argv names the file they write.
+ *
+ * A closed list, on purpose. `tee` writes every non-flag operand; `cp`, `mv` and
+ * `install` write their destination operand — the value of `-t`/
+ * `--target-directory` in any of its spellings when present, else the last
+ * positional — and, because that operand may name a directory the sources are
+ * copied *into*, the same joined with each source's basename, so `cp
+ * authorized_keys ~/.ssh/` is caught rather than only `cp k
+ * ~/.ssh/authorized_keys`. `install -d` creates every operand. `dd of=` writes
+ * the value. Every other verb is a documented residual: a guess about an
+ * unrecognised binary's operands must not reach this list (the
+ * `speculativeOperands: false` ruling), and #230's decision 1 already ruled that
+ * extracting paths from shell text can never be complete — so the README lists
+ * these forms and names the rest as governed by class and approval instead.
+ *
+ * `env cp …`, `sudo cp …`, `timeout 5 cp …` and `xargs -I {} cp …` reach the
+ * verb through `effectiveCommandIndex` and its xargs-stepping sibling.
+ */
+function writeVerbTargets(command: string, dialect: ShellDialect): string[] {
+  const targets: string[] = [];
+  for (const words of tokenizeSegments(command, dialect)) {
+    const heads = [effectiveCommandIndex(words), indexPastXargsFlags(words)]
+      .filter((i, idx, all) => i !== -1 && all.indexOf(i) === idx);
+    for (const idx of heads) {
+      const head = stripPath(words[idx]);
+      const args = words.slice(idx + 1);
+
+      if (head === 'tee') {
+        targets.push(...args.filter((a) => !a.startsWith('-')));
+        continue;
+      }
+      if (head === 'dd') {
+        for (const arg of args) {
+          if (arg.startsWith('of=')) targets.push(arg.slice(3));
+        }
+        continue;
+      }
+      if (head === 'cp' || head === 'mv' || head === 'install') {
+        const positional = copyPositionals(args);
+        if (head === 'install' && args.some((a) => a === '-d' || a === '--directory')) {
+          targets.push(...positional);
+          continue;
+        }
+        const tIndex = args.findIndex((a) => a === '-t' || a === '--target-directory'
+          || /^-t.+/.test(a) || a.startsWith('--target-directory='));
+        let dest: string | null = null;
+        let sources = positional;
+        if (tIndex !== -1) {
+          const flag = args[tIndex];
+          if (flag === '-t' || flag === '--target-directory') {
+            dest = args[tIndex + 1] || null;
+          } else {
+            const eq = flag.indexOf('=');
+            dest = eq === -1 ? flag.slice(2) : flag.slice(eq + 1);
+          }
+        } else if (positional.length >= 2) {
+          dest = positional[positional.length - 1];
+          sources = positional.slice(0, -1);
+        }
+        if (dest === null || dest === '') continue;
+        targets.push(dest);
+        for (const src of sources) {
+          const base = stripPath(src);
+          if (base !== '') targets.push(`${dest}/${base}`);
+        }
+      }
+    }
+  }
+  return targets;
+}
+
+/**
+ * The never-allowed family cache — same shape and reason as `normalizedCache`:
+ * three ForbiddenRule entries ask the same (command, dialect) question in a row,
+ * and each ask re-ran both scans over the whole command. Keyed with the dialect
+ * because both readings of one command are asked in the same row.
+ */
+const neverAllowedWriteCache = new Map<string, NeverAllowedWriteTarget | null>();
+
+/**
+ * Which never-allowed family this command's certain write forms name, or null.
+ * Both dialects are tried by the caller (findForbiddenMatchInDialect), and nested
+ * commands reach this through the same recursion every other rule uses.
+ */
+function findNeverAllowedWriteFamily(command: string, dialect: ShellDialect): NeverAllowedWriteTarget | null {
+  const key = `${dialect}\u0000${command}`;
+  if (neverAllowedWriteCache.has(key)) return neverAllowedWriteCache.get(key)!;
+  let family: NeverAllowedWriteTarget | null = null;
+  for (const candidate of [...redirectTargets(command, dialect), ...writeVerbTargets(command, dialect)]) {
+    family = findNeverAllowedWriteTarget(candidate);
+    if (family !== null) break;
+  }
+  neverAllowedWriteCache.set(key, family);
+  if (neverAllowedWriteCache.size > 8) {
+    neverAllowedWriteCache.delete(neverAllowedWriteCache.keys().next().value as string);
+  }
+  return family;
+}
+
 const FORBIDDEN_RULES: ForbiddenRule[] = [
   ...FORBIDDEN_PATTERNS.map((re) => ({
     label: String(re),
@@ -1614,6 +1875,10 @@ const FORBIDDEN_RULES: ForbiddenRule[] = [
   },
   { label: 'dd writing to a block device (of=/dev/…)', test: (c, dialect) => writesToDevice(c, dialect) },
   { label: 'a recursive chown of the filesystem root', test: (c, dialect) => chownsRoot(c, dialect) },
+  ...(['/etc/cron', '/etc/systemd', 'authorized_keys'] as const).map((family) => ({
+    label: neverAllowedWriteLabel(family),
+    test: (command: string, dialect: ShellDialect) => findNeverAllowedWriteFamily(command, dialect) === family,
+  })),
 ];
 
 /**
@@ -2242,9 +2507,10 @@ function classifyCommandInDialect(command: string, depth: number, dialect: Shell
     if (CLASS_RANK[parsed.class] > CLASS_RANK[highest.class]) highest = parsed;
   }
 
-  // `readOnlyRejection` only ever describes the outer command's own grammar
-  // rejection, and only means anything when that is also what decided the
-  // final class. `highest === outer` (reference equality) is exactly that
+  // `readOnlyRejection` only ever describes why the outer command's reader was
+  // refused read-only — a grammar rejection or a shell metacharacter, see
+  // `ReadOnlyRejection` — and only means anything when that is also what decided
+  // the final class. `highest === outer` (reference equality) is exactly that
   // condition: the synthetic floor and the nested-command loop above only
   // ever replace `highest` with something of strictly higher rank than
   // `outer`'s, so if either one fired, `highest` is no longer `outer` and the
@@ -2257,16 +2523,8 @@ function classifyCommandInDialect(command: string, depth: number, dialect: Shell
   return result;
 }
 
-/**
- * `classifyOuter`'s own return shape, carrying the word a reader's grammar
- * rejected so a later stage can name it in a refusal message. `classifyCommand`
- * copies this onto its own `ParsedCommand` result — but only when `outer` is
- * also the winning side, see the comment above.
- */
-type ClassifiedOuter = ParsedCommand & { readOnlyRejection?: { binary: string; word: string } };
-
 /** The class of the command itself, reading none of what it carries. */
-function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter {
+function classifyOuter(trimmed: string, dialect: ShellDialect): ParsedCommand {
   const binary = extractBinary(trimmed, dialect);
   const fullCommand = trimmed;
 
@@ -2299,8 +2557,21 @@ function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter 
   const twoWordPrefix = words.slice(0, 2).join(' ');
   if (READ_ONLY_ALLOWLIST.has(binary) || READ_ONLY_ALLOWLIST.has(twoWordPrefix)
     || READ_ONLY_SYNTHETIC.has(binary)) {
-    if (SHELL_CONTROL_CHARS.test(trimmed)) {
-      return { binary, fullCommand, class: 'safe' as CommandClass };
+    // Whichever key matched decides both which entry answers and how many
+    // leading words are the command name rather than an argument: a two-word
+    // entry's grammar reads words[2..], a one-word entry's reads words[1..]. An
+    // SFTP verb's two-word prefix is never a key, so it is named by itself.
+    const matchedTwoWord = READ_ONLY_ALLOWLIST.has(twoWordPrefix);
+    const readerName = matchedTwoWord ? twoWordPrefix : binary;
+
+    const metacharacter = SHELL_CONTROL_CHARS.exec(trimmed);
+    if (metacharacter) {
+      return {
+        binary,
+        fullCommand,
+        class: 'safe' as CommandClass,
+        readOnlyRejection: { binary: readerName, word: metacharacter[0], cause: 'shell-metacharacter' },
+      };
     }
 
     // The SFTP verbs are synthesised by the tool layer, never typed by a caller,
@@ -2310,11 +2581,6 @@ function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter 
       return { binary, fullCommand, class: 'read-only' as CommandClass };
     }
 
-    // Whichever key matched decides both which entry answers and how many
-    // leading words are the command name rather than an argument: a two-word
-    // entry's grammar reads words[2..], a one-word entry's reads words[1..].
-    const matchedTwoWord = READ_ONLY_ALLOWLIST.has(twoWordPrefix);
-    const readerName = matchedTwoWord ? twoWordPrefix : binary;
     const entry = READERS[readerName];
     const argWords = words.slice(matchedTwoWord ? 2 : 1);
 
@@ -2331,7 +2597,7 @@ function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter 
           binary,
           fullCommand,
           class: 'safe' as CommandClass,
-          readOnlyRejection: { binary: readerName, word: globWord },
+          readOnlyRejection: { binary: readerName, word: globWord, cause: 'grammar' },
         };
       }
     }
@@ -2342,7 +2608,7 @@ function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter 
         binary,
         fullCommand,
         class: 'safe' as CommandClass,
-        readOnlyRejection: { binary: readerName, word: match.word },
+        readOnlyRejection: { binary: readerName, word: match.word, cause: 'grammar' },
       };
     }
 
@@ -2353,17 +2619,40 @@ function classifyOuter(trimmed: string, dialect: ShellDialect): ClassifiedOuter 
 }
 
 /**
- * The sentence a refusal appends when it carries a `readOnlyRejection`, worded
- * so the reason names the binary that would have qualified and the argv word
- * that cost it: "is not accepted there" rather than "is not one of them",
- * because most rejections are operand rules (`hostname NAME`, `sort /data`) or
- * a listed value flag missing its value, where "is not one of them" would be
- * false — it may be a perfectly good flag name, just not one bare or in this
- * position. One function so the engine's role-binding denial and
- * `read-command`'s `enforceClass` refusal never drift into two spellings of
- * the same sentence.
+ * The sentence a refusal appends when it carries a `readOnlyRejection`, in one of
+ * two shapes chosen by its `cause`. Both name the reader that would have qualified
+ * and what cost it the class.
+ *
+ * - `grammar`: names the argv word, as "is not accepted there" rather than "is not
+ *   one of them", because most rejections are operand rules (`hostname NAME`,
+ *   `sort /data`) or a listed value flag missing its value, where "is not one of
+ *   them" would be false — it may be a perfectly good flag name, just not one bare
+ *   or in this position.
+ * - `shell-metacharacter`: names the character, and for the SFTP verbs says it is
+ *   in the remote path (#224).
+ *
+ * One function so the engine's role-binding denial and `read-command`'s
+ * `enforceClass` refusal never drift into two spellings of the same sentence.
  */
-function formatReadOnlyRejection(rejection: { binary: string; word: string }): string {
+function formatReadOnlyRejection(rejection: ReadOnlyRejection): string {
+  if (rejection.cause === 'shell-metacharacter') {
+    // `\n` and `\r` are in SHELL_CONTROL_CHARS, and quoted raw they would break the
+    // sentence across lines or render as nothing. A backtick is in it too, and inside
+    // single backticks it would print as three in a row; double backticks with
+    // padding is Markdown's own way to quote one.
+    const char = rejection.word.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+    const quoted = char === '`' ? '`` ` ``' : `\`${char}\``;
+    // The SFTP verbs' operand is a path the tool layer built the command from, so the
+    // path is what the caller can change — not "the command", which they never typed.
+    // The verb is named as the audit record spells it (`sftp:list`), not as the tool
+    // (`sftp-list`), so the refusal and the record it is filed under read the same.
+    if (READ_ONLY_SYNTHETIC.has(rejection.binary)) {
+      return `The remote path contains ${quoted}, which counts as a shell metacharacter here, ` +
+        `so \`${rejection.binary}\` is read-only only for a path without one.`;
+    }
+    return `\`${rejection.binary}\` is read-only only when the command contains no shell metacharacter; ` +
+      `${quoted} is one.`;
+  }
   // The rejected word can be the empty string — a quoted empty operand
   // (`hostname ""`) — and two bare backticks would render as a blank where
   // the word that cost the class should be. `""` is the shell's own spelling
