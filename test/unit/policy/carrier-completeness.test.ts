@@ -74,7 +74,11 @@ describe('an unrecognised binary cannot hide a command in its operands', () => {
   it('leaves the commands an operator runs all day alone', () => {
     for (const [command, expected] of [
       ['kubectl get pods', 'safe'],
-      ['make deploy', 'safe'],
+      // `make` itself was this list's example until GHSA-cm4c-4q74-mgmj: its
+      // recipes are shell commands this classifier never sees, so every make
+      // invocation is destructive now. A single-word operand still carries
+      // nothing — that is what this row pins — so another builder stands in.
+      ['cargo build', 'safe'],
       ['docker run -e FOO=bar img', 'safe'],
       ['terraform apply', 'safe'],
       ["grep 'sudo' /var/log/auth.log", 'read-only'],
@@ -539,7 +543,7 @@ describe('fix round 4: the pwsh tolerance reaches past an exec wrapper, not just
 
   it('does not reopen mention-vs-invocation: pwsh as an unrelated flag value stays safe', () => {
     // The exact shape `from === 0` used to protect, now protected by
-    // `from === effectiveCommandIndex(words)` instead: `pwsh` here is a VALUE
+    // `from` being a reading's command index (`commandHeads`) instead: `pwsh` here is a VALUE
     // of `customtool`'s own `--search` flag, never actually invoked, and
     // `customtool` — not `pwsh` — is the effective command word.
     const command = `customtool --search pwsh -ExecutionPolicy Bypass -EncodedCommand ${encode('sudo id')}`;

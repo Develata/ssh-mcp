@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           # 90 of the windows job's 140 seconds were an uncached install, and that job
@@ -163,7 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           # 90 of the windows job's 140 seconds were an uncached install, and that job
@@ -221,7 +221,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -268,13 +268,19 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: echo "$NEEDS"
-      # One expression over `needs.*`, so adding a job to `needs` above covers it
-      # by construction. Three explicit comparisons was the first shape, and it
-      # made the gate's correctness depend on three lists staying in step — the
-      # same failure mode one level up from the one this job exists to prevent.
-      - name: Fail if any job did not succeed
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
-        run: exit 1
+      # Fail closed for every non-success outcome (including abandoned).
+      # Unlike an enumerated deny-list this cannot silently accept new GitHub
+      # outcome values or unrun required jobs.
+      - name: Fail unless every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          bad=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+          if [ -n "$bad" ]; then
+            echo "::error::not every job succeeded:"
+            echo "$bad"
+            exit 1
+          fi
 
   security-scan:
     runs-on: ubuntu-latest
@@ -315,7 +321,8 @@ jobs:
               --config=p/owasp-top-ten \
               --config=p/command-injection \
               --exclude=docker/alpine-sshd/Dockerfile \
-              --exclude=docker/dropbear-sshd/Dockerfile
+              --exclude=docker/dropbear-sshd/Dockerfile \
+              --exclude=.oss-scanner/Dockerfile
 
       # Excluded above rather than suppressed globally: both are throwaway test
       # fixtures running sshd, which has to be root to authenticate users and open
@@ -345,7 +352,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           # Note what is *not* pinned here. The action ref fixes its default bundle —
           # v4.37.6's defaults.json says CLI 2.26.2 — but the action prefers a newer CLI
@@ -364,10 +371,10 @@ jobs:
           config-file: ./.github/codeql-config.yml
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/autobuild@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
 
       - name: Analyze
-        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           # Keep CodeQL analysis in fork CI without uploading code-scanning results.
           upload: never
@@ -435,7 +442,7 @@ jobs:
           # registry unit test). Nothing links them, so adding a tool means
           # editing four places and this is the one no local run catches: the
           # whole suite went green with the image still expecting eleven.
-          TOOL_COUNT: '14'
+          TOOL_COUNT: '15'
         run: |
           set -euo pipefail
           {

@@ -76,7 +76,7 @@ updates:
   # Pinning without an updater is how a fixture quietly ends up years old. Both
   # rewrite the digest and leave the readable tag beside it.
   - package-ecosystem: docker
-    directory: /
+    directories: [/, /.oss-scanner]
     schedule:
       interval: monthly
     cooldown:
