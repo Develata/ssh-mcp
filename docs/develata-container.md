@@ -88,7 +88,7 @@ test their own candidate and cannot enter either write-enabled job.
    and promote the verified index to `latest` as the last registry mutation.
 
 The smoke test verifies UID 65532, the exact MIT license, package/MCP version,
-a sequential initialization handshake, 14 distinct tools including
+a sequential initialization handshake, 15 distinct tools including
 `run-command`, and refusal to execute without configuration. Network access
 is disabled in smoke-test containers. A changed tool inventory or Dockerfile
 packaging anchor intentionally stops publication for review.
@@ -114,6 +114,33 @@ this file, all container helpers/workflow, fork CI's read-only defaults,
 Codecov owner guards, CodeQL `upload: never`, and the upstream-only
 Changesets/Scorecard guards. Then push the reviewed result to main or manually
 run the workflow. No PAT or broader repository setting is needed.
+
+## Reviewed upstream v2.22.0 ancestry repair (2026-10-27)
+
+The October 27 scheduled `prepare` job on fork commit `ed33ded` failed a
+three-way merge of upstream tag `v2.22.0`: Git reported a content conflict in
+`.github/workflows/ci.yml`. The previous day's green run skipped the
+three-day gate and did **not** exercise upstream merging.
+
+The merge was reconstructed against the common ancestor `58b03f10`, using
+three Git trees rather than treating GitHub's three-dot commit comparison as
+an ordinary tree diff. It incorporates **90 changed upstream application,
+test, docs, and dependency paths** without a non-protected conflict. The
+fork-owned `.github/` paths and this document remain explicitly protected.
+Relevant upstream workflow improvements were separately reviewed and applied
+to the fork: a fail-closed CI gate, tool-inventory count 15, security scanner
+exclusion for the OSS-scanner test fixture, updated pinned Actions, and
+Dependabot coverage for that fixture. Fork-only Codecov/Changesets/Scorecard
+owner guards and CodeQL `upload: never` were preserved.
+
+The reviewed two-parent merge records upstream release commit `f5afe240`
+as an ancestor and contains the integrated upstream source plus the
+fork-specific automation. It does **not** weaken `prepare.mjs`: future
+upstream changes under `.github/` still trigger protected-path review.
+
+**Merge this PR using a merge commit, not squash or rebase.** The upstream
+parent must survive in `main`; squashing would discard the reviewed Git
+ancestry and reopen the historical CI conflict.
 
 ## Permissions and verification limits
 

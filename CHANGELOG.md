@@ -1,5 +1,55 @@
 # ssh-mcp
 
+## 2.22.0
+
+### Minor Changes
+
+- [`a66f429`](https://github.com/tufantunc/ssh-mcp/commit/a66f4298983ea366f2b3173ec2baebdcd2864e89) Thanks [@tufantunc](https://github.com/tufantunc)! - `fix(policy)`: the command classifier reads a command word the same way whether it carries a directory part, a Windows executable suffix or a different case, and reads past the words an exec wrapper takes before the command it runs, using each wrapper's own options. Where those words can be read more than one way, the strictest reading decides. A command that relied on the previous defaults may now prompt for approval, or be refused outright under a profile that does not grant the class it earns. `command -v NAME` and `command -V NAME` are read as the lookups they are and no longer take the class of `NAME`.
+
+## 2.21.0
+
+### Minor Changes
+
+- [#290](https://github.com/tufantunc/ssh-mcp/pull/290) [`769b445`](https://github.com/tufantunc/ssh-mcp/commit/769b445beb85f2a2b7b37dc58a7b55a9473befe7) Thanks [@tufantunc](https://github.com/tufantunc)! - **`config.toml` can be reloaded without a restart** ([#288](https://github.com/tufantunc/ssh-mcp/issues/288)). A new tool, `reload-config`, reports the config file's status (path, source, load time and the sha256 of its bytes, never its contents) with `action: "status"`, and re-reads and applies the file with `action: "reload"`. Sending the process `SIGHUP` does the same reload, except on Windows. A reload runs every check startup runs, including the permission and ACL check, and applies the file only if all of them pass; a refused reload changes nothing. It also refuses a changed or removed `defaults.transferRoot` (adding one is allowed) and a server started from `--host`/`--user` flags; both need a restart. Command-line flags are never reloaded. Policy changes apply to open connections from their next command; a removed profile or a changed connection field closes that connection and its sessions, and anything running through it as a bastion. Every applied reload retires the approval grants made before it; an approval answered after a reload is re-checked against the new rules, and so is a decision (an allow, or a grant reuse) that a reload landed in the middle of. A connection still being opened when a reload lands fails only if the reload closes its profile; any other is kept, with the new profile. Reloads run one at a time, and those asked for while one is waiting to start join it. Each reload is audited as one `config:reload` record: applied, refused, or (rule `config-reload-partial`) failed after the swap began. `reload-config` also answers on a server started without a config, so writing the file and reloading configures it. **Behaviour change:** outside Windows, `SIGHUP` no longer stops the server; it triggers a reload. A stdio server still exits when its client closes stdin. An HTTP server started from a terminal is no longer stopped when that terminal closes, since its hangup is now handled; stop it with `SIGTERM` or `SIGINT`, or run it under a supervisor. **Behaviour change:** a config in which two profiles share a name is now refused at startup, and by a reload; before, the server started and used the first of the two.
+
+## 2.20.2
+
+### Patch Changes
+
+- [`b2d0a0e`](https://github.com/tufantunc/ssh-mcp/commit/b2d0a0e1e085cad07648270da9a9f83b8255e219) Thanks [@tufantunc](https://github.com/tufantunc)! - `fix(policy)`: the never-allowed rules read the operation rather than one spelling of it — flag clusters in either order, separated flags and long forms, root targets that resolve to `/`, world-writable modes beyond the literal `777`, the `-t`/subcommand device formatters, the firewall policy spelling, and the same operations behind a wrapper's own operands. A mention of a forbidden phrase is no longer refused as though it were an invocation.
+
+### Security
+
+- Fixed [GHSA-5cjr-rc2p-f66f](https://github.com/tufantunc/ssh-mcp/security/advisories/GHSA-5cjr-rc2p-f66f): the never-allowed rules matched one spelling of an operation, so `rm -fr /`, `rm -r -f /`, `rm --recursive --force /`, `rm -R -f /` and `mkfs -t ext4 /dev/sda1` classified `safe` — the one class the default `ask-destructive` policy never prompts on — and executed with no approval at all, while the same operation in its canonical spelling was refused outright. The rules now read the operation through the tokeniser: flag clusters in either order, separated flags and long forms, root targets that resolve to `/` (`//`, `/etc/..`), world-writable modes beyond the literal `777`, the `-t`/subcommand device formatters and their siblings, the firewall policy spelling, and the same operations behind a wrapper's own operands (`flock /tmp/lk rm -rf /`). A mention of a forbidden phrase is no longer refused as an invocation. Reported by @wildminder. Affected: `< 2.20.2`.
+
+## 2.20.1
+
+### Patch Changes
+
+- [#275](https://github.com/tufantunc/ssh-mcp/pull/275) [`d47a335`](https://github.com/tufantunc/ssh-mcp/commit/d47a335215bc493667585b54fc11c967dbc6e435) Thanks [@dependabot](https://github.com/apps/dependabot)! - Allow `@napi-rs/keyring` 2 (`^2.1.1`, was `^1.1.0`) for `auth = "keychain"` profiles. Its one breaking change is how a store failure is reported: a locked or inaccessible keychain used to read as "no entry" and now raises an error. This server already caught that error, so the outcome is the same — the lookup fails and the remaining credential sources are tried — except that the failure is now logged (`Keychain lookup failed …`) instead of passing silently.
+
+- [#274](https://github.com/tufantunc/ssh-mcp/pull/274) [`6fd0f53`](https://github.com/tufantunc/ssh-mcp/commit/6fd0f532b907d086f586687d085854980c462c6a) Thanks [@dependabot](https://github.com/apps/dependabot)! - Require `@modelcontextprotocol/sdk` `^1.32.1` (was `^1.31.0`), so an install can no longer keep an SDK affected by GHSA-46jr-4wx8-v453 (one HTTP request could exhaust server memory while it was validated). Over this server's HTTP transport that request is only accepted after the bearer token check, and the body is capped at 1 MiB, so it takes a token holder to send it. The same SDK release also fixes GHSA-rvq5-wwqv-78pq, GHSA-22jm-h49p-29qw and GHSA-6prh-2h8m-c8cw, none of which this server reaches: it checks its own bearer token rather than using the SDK's `requireBearerAuth()`, passes no `taskStore`, and uses no SDK client transport. A dependency scanner still reports all four against any install that resolves an older SDK.
+
+## 2.20.0
+
+### Minor Changes
+
+- [`dd61692`](https://github.com/tufantunc/ssh-mcp/commit/dd61692884d04d661083484a45c74d7b31bcd883) Thanks [@tufantunc](https://github.com/tufantunc)! - `fix(policy)`: the command classifier recognises additional exec carriers and privilege brokers. A command that relied on the previous default may now prompt for approval, or be refused outright under a profile that does not grant the class it earns.
+
+### Security
+
+- Fixed [GHSA-cm4c-4q74-mgmj](https://github.com/tufantunc/ssh-mcp/security/advisories/GHSA-cm4c-4q74-mgmj): common exec carriers — `sqlite3` `.shell`/`.system`, `tar --checkpoint-action=exec=…`, `gdb -ex`/`--eval-command`, `expect -c`, the vi family's `-c`/`--cmd`, `make`, `ssh host cmd` — and the privilege brokers `docker run --privileged`, `docker exec -u 0`, `systemd-run --uid=0` and `nsenter -t` classified `safe`, the one class that never reaches the approval gate, so a role limited to safe commands could run any of them — root included — with no approval and no role check. Each now classifies `destructive` or `privileged`, across the flag long forms, attached and `user:group` values, subcommand synonyms, option abbreviations, detached values, wrapper prefixes and Windows `.exe`/case spellings the review round measured. Reported by @NotAFlightRisk. Affected: `<= 2.19.2`.
+
+## 2.19.2
+
+### Patch Changes
+
+- [`40315cf`](https://github.com/tufantunc/ssh-mcp/commit/40315cf46ede8bfa93e05c579d70545122d39cbd) Thanks [@tufantunc](https://github.com/tufantunc)! - `privileged-command`: harden how the sudo password reaches sudo, and always scrub the configured sudo password from command output. The wrapped command now runs with stdin at EOF; approval prompts and audit records show `exec 0</dev/null;` inside the wrapped `sudo … sh -c` string.
+
+### Security
+
+- Fixed [GHSA-9m75-x2ch-j4jr](https://github.com/tufantunc/ssh-mcp/security/advisories/GHSA-9m75-x2ch-j4jr): `privileged-command` could leave the sudo password readable by the wrapped command when sudo did not prompt (e.g. NOPASSWD); the command's stdin is now /dev/null and the configured sudo password is always scrubbed from output. Reported by @shinjiyu. Affected: `<= 2.19.1`.
+
 ## 2.19.1
 
 ### Patch Changes

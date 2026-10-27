@@ -53,13 +53,13 @@ try {
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   const listing = await request(2, 'tools/list', {});
   const names = listing.result?.tools?.map(tool => tool.name);
-  assert.equal(names?.length, 14, 'Tool inventory changed; review the expected count');
-  assert.equal(new Set(names).size, 14);
+  assert.equal(names?.length, 15, 'Tool inventory changed; review the expected count');
+  assert.equal(new Set(names).size, 15);
   assert.ok(names.includes('run-command'));
   const call = await request(3, 'tools/call', { name: 'run-command', arguments: { command: 'echo hi' } });
   assert.equal(call.result?.isError, true);
   assert.match(JSON.stringify(call.result?.content), /No config file found/);
-  console.log(platform + ': UID 65532, MIT license, version ' + version + ', MCP handshake, 14 tools and unconfigured refusal passed');
+  console.log(platform + ': UID 65532, MIT license, version ' + version + ', MCP handshake, 15 tools and unconfigured refusal passed');
 } finally {
   clearTimeout(timer);
   child.stdin.end();
