@@ -341,7 +341,15 @@ describe('cost', () => {
     const large = build(200_000);
     expect(classOf(small), small.slice(0, 24)).toBe('safe');
     expect(classOf(large), large.slice(0, 24)).toBe('safe');
-    const ratio = growthRatio(() => classOf(small), () => classOf(large));
+    // Windows process CPU accounting advances in ~15.6 ms ticks; a 50 ms
+    // reading spans only 3-4 ticks. Require ~16 ticks per reading there to
+    // avoid sampling quantization masquerading as superlinear growth. Keep
+    // the same 8x bound and the five paired CPU-time medians.
+    const ratio = growthRatio(
+      () => classOf(small),
+      () => classOf(large),
+      { minTotalMs: process.platform === 'win32' ? 250 : 50 },
+    );
     expect(ratio, `4x the input cost ${ratio.toFixed(1)}x the time`).toBeLessThan(8);
     // Five pairs cost about 1.75x the old three-and-three under coverage, where each
     // classification outlasts the 50ms reading floor, and CI's coverage jobs already
